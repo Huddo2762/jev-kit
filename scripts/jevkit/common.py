@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -756,6 +757,8 @@ def budget_from(args: argparse.Namespace) -> Budget:
 
 
 def emit(data: Any) -> None:
+    if hasattr(sys.stdout, "reconfigure"):  # Windows pipes default to the ANSI code page, which can't hold every character
+        sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps(data, indent=1, ensure_ascii=False))
 
 

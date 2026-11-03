@@ -188,6 +188,22 @@ def domain_allowed(url: str, allow: list[str]) -> bool:
 # ------------------------------------------------------------------ session
 
 def _alive(pid: int) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) is no probe on Windows: signal 0 is CTRL_C_EVENT
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32")
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = wintypes.DWORD()
+        try:
+            return bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -229,10 +245,26 @@ def _chromium_path() -> str:
         return p.chromium.executable_path
 
 
+def _installed_chrome() -> str | None:
+    """Google Chrome itself, for machines that refuse Playwright's unsigned Chromium (Windows Smart App Control)."""
+    roots = [os.environ.get(v) for v in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+    paths = [Path(r) / "Google" / "Chrome" / "Application" / "chrome.exe" for r in roots if r]
+    paths += [Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), Path("/usr/bin/google-chrome")]
+    return next((str(p) for p in paths if p.exists()), None)
+
+
 def _kill(data: dict[str, Any]) -> bool:
     pid = int(data.get("pid", 0))
     if not pid or not _alive(pid):
         return False
+    if os.name == "nt":  # no SIGTERM or process groups: ask its windows to close, then end the tree
+        subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, timeout=15)
+        for _ in range(50):
+            if not _alive(pid):
+                break
+            time.sleep(0.1)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
+        return True
     os.kill(pid, signal.SIGTERM)  # Chrome shuts down cleanly on TERM and saves cookies
     for _ in range(50):
         if not _alive(pid):
@@ -263,8 +295,16 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     if not args.show:
         cmd.append("--headless=new")
     cmd.append(args.url or "about:blank")
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
+    detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+              if os.name == "nt" else {"start_new_session": True})
+    popen = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, **detach}
+    try:
+        proc = subprocess.Popen(cmd, **popen)
+    except OSError:  # Windows Smart App Control refuses Playwright's unsigned Chromium: use Google Chrome
+        chrome = _installed_chrome()
+        if not chrome:
+            raise
+        proc = subprocess.Popen([chrome, *cmd[1:]], **popen)
     for _ in range(150):
         if _cdp(port) is not None:
             break
@@ -318,9 +358,11 @@ class Browser:
                 raise Stop("no browser session is open; run `web.py open` (or `open --show` to log in by hand)")
             else:
                 PROFILE.mkdir(parents=True, exist_ok=True)
-                self.context = self.pw.chromium.launch_persistent_context(
-                    str(PROFILE), headless=not self.show, channel="chromium", args=LAUNCH_FLAGS[:-1],
-                    viewport={"width": 1280, "height": 900})
+                opts = {"headless": not self.show, "args": LAUNCH_FLAGS[:-1], "viewport": {"width": 1280, "height": 900}}
+                try:
+                    self.context = self.pw.chromium.launch_persistent_context(str(PROFILE), channel="chromium", **opts)
+                except Exception:  # Windows Smart App Control refuses Playwright's unsigned Chromium
+                    self.context = self.pw.chromium.launch_persistent_context(str(PROFILE), channel="chrome", **opts)
             pages = [p for p in self.context.pages if not p.url.startswith(("devtools:", "chrome-extension:"))]
             self.page = pages[-1] if pages else self.context.new_page()
         except BaseException:

@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -429,6 +430,21 @@ class UnitTest(unittest.TestCase):
         self.assertTrue(web.domain_allowed("https://www.example.com/x", ["example.com"]))
         self.assertFalse(web.domain_allowed("https://example.com.evil.io/", ["example.com"]))
         self.assertTrue(web.domain_allowed("about:blank", ["example.com"]))
+
+    def test_alive_probes_without_signalling(self) -> None:
+        # On Windows os.kill(pid, 0) sends CTRL_C_EVENT; the probe must not touch the process.
+        self.assertTrue(web._alive(os.getpid()))
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertFalse(web._alive(proc.pid))
+
+    def test_emit_survives_a_narrow_console_encoding(self) -> None:
+        # Windows pipes default to the ANSI code page; scraped text can hold anything.
+        code = "import sys; sys.path.insert(0, sys.argv[1]); from jevkit import common; common.emit({'t': 'Café 東京 ✈'})"
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        out = subprocess.run([sys.executable, "-c", code, str(KIT / "scripts")], capture_output=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr.decode("utf-8", "replace"))
+        self.assertEqual(json.loads(out.stdout.decode("utf-8"))["t"], "Café 東京 ✈")
 
 
 def tearDownModule() -> None:
